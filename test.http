@@ -1,10 +1,10 @@
-### Set up a new RSS feed (PPLWare)
+### Set up a new RSS feed (Plpware)
 POST http://localhost:3000/rss
 Content-Type: application/json
 
 {
   "url": "https://pplware.sapo.pt/feed",
-  "name": "Reddit news",
+  "name": "Plpware",
   "pub_key": "npub1",
   "priv_key": "nsec1",
   "relay": "ws://127.0.0.1:9090/relay"
@@ -16,8 +16,14 @@ Content-Type: application/json
 
 {
   "url": "https://revistaoeste.com/feed/",
-  "name": "Reddit news",
+  "name": "revistaoeste",
   "pub_key": "npub1",
   "priv_key": "nsec1",
   "relay": "ws://127.0.0.1:9090/relay"
 }
+
+### Get all RSS feeds
+GET http://localhost:3000/rss
+
+### Get all Events
+GET http://localhost:3000/events

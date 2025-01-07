@@ -33,6 +33,7 @@ type Feed struct {
 
 type FeedRequest struct {
 	Url     string `json:"url"`
+	Name    string `json:"name"`
 	PubKey  string `json:"pub_key"`
 	PrivKey string `json:"priv_key"`
 	Relay   string `json:"relay"`
@@ -46,6 +47,8 @@ var (
 	snakeCaseRegex *regexp.Regexp
 	feedParser     *gofeed.Parser
 	Data           FeedData
+	dPrefix        = "feed_"
+	eventPrefix    = "event_" // event_ + rss_name +_+ eventID (hash of event)
 )
 
 func init() {
@@ -105,8 +108,17 @@ func setupRoutes() *fiber.App {
 
 	app.Post("/rss", addRssHandler)
 	app.Get("/rss", getRssHandler)
+	app.Get("/events", listEventsHandler)
 
 	return app
+}
+
+func listEventsHandler(c *fiber.Ctx) error {
+	events, err := GetAllEventsFromDb()
+	if err != nil {
+		return fiberError(c, fiber.StatusInternalServerError, "error getting events", err)
+	}
+	return c.JSON(events)
 }
 
 func addRssHandler(c *fiber.Ctx) error {
@@ -161,7 +173,9 @@ func GetRssToFeed() (FeedData, error) {
 		return Data, nil
 	}
 
-	iter, _ := db.NewIter(&pebble.IterOptions{})
+	iter, _ := db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(dPrefix),
+	})
 	defer iter.Close()
 
 	for iter.First(); iter.Valid(); iter.Next() {
@@ -186,16 +200,49 @@ func AddRssToFeed(feed *Feed) error {
 		return fmt.Errorf("error marshalling feed: %w", err)
 	}
 
-	if err := db.Set([]byte(feed.Url), value, pebble.Sync); err != nil {
+	if err := db.Set([]byte(dPrefix+feed.Url), value, pebble.Sync); err != nil {
 		return fmt.Errorf("error setting data to db: %w", err)
 	}
 	return nil
+}
+func SaveEventToDb(feed *Feed, ev nostr.Event) error {
+	value, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("error marshalling event: %w", err)
+	}
+
+	key := fmt.Sprintf("%s%s_%s", eventPrefix, feed.Url, ev.ID)
+
+	if err := db.Set([]byte(key), value, pebble.Sync); err != nil {
+		return fmt.Errorf("error setting event to db: %w", err)
+	}
+	return nil
+}
+func GetAllEventsFromDb() ([]nostr.Event, error) {
+	var events []nostr.Event
+	iter, _ := db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(eventPrefix),
+	})
+	defer iter.Close()
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var ev nostr.Event
+		if err := json.Unmarshal(iter.Value(), &ev); err != nil {
+			return nil, fmt.Errorf("error unmarshalling event: %w", err)
+		}
+		events = append(events, ev)
+	}
+
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("error during iteration: %w", err)
+	}
+	return events, nil
 }
 
 func setupCron() *cron.Cron {
 	c := cron.New()
 
-	c.AddFunc("*/2 * * * *", func() {
+	c.AddFunc("*/5 * * * *", func() {
 		feeds, err := GetRssToFeed()
 		if err != nil {
 			fmt.Println("Error getting feeds for cron: ", err)
@@ -278,6 +325,10 @@ func ProcessFeedItem(feed *Feed, item *gofeed.Item) {
 	}
 
 	log.Debug("Event: ", ev)
+	err = SaveEventToDb(feed, ev)
+	if err != nil {
+		log.Error("Error saving event to db: ", err)
+	}
 
 	feed.ToPublish <- ev
 }
