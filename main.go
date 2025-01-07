@@ -3,29 +3,32 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
-	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
-	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
-	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/log"
-	"github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/mmcdole/gofeed"
-	"github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
-	"github.com/robfig/cron/v3"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
+	"github.com/cockroachdb/pebble"
+	"github.com/goccy/go-json"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/mmcdole/gofeed"
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/robfig/cron/v3"
 )
 
 type Feed struct {
-	FeedRequest
-	ToPublish     chan nostr.Event
-	PublishedLink []string
-	mu            sync.Mutex
+	FeedRequest   `json:"feed_request"`
+	ToPublish     chan nostr.Event `json:"-"`
+	PublishedLink []string         `json:"published_link"`
+	mu            sync.Mutex       `json:"-"`
 }
 
 type FeedRequest struct {
@@ -35,12 +38,14 @@ type FeedRequest struct {
 	Relay   string `json:"relay"`
 }
 
+type FeedData map[string]*Feed
+
 var (
-	Data           = make(map[string]*Feed)
-	dataMu         sync.RWMutex
+	db             *pebble.DB
 	mdConverter    *converter.Converter
 	snakeCaseRegex *regexp.Regexp
 	feedParser     *gofeed.Parser
+	Data           FeedData
 )
 
 func init() {
@@ -48,18 +53,28 @@ func init() {
 	snakeCaseRegex = regexp.MustCompile("[^a-zA-Z0-9]+")
 	feedParser = gofeed.NewParser()
 	feedParser.UserAgent = "NostrFeedBot/0.1"
+	Data = make(FeedData)
 }
 
 func main() {
+	var err error
+	db, err = pebble.Open("pebble_data", &pebble.Options{})
+	if err != nil {
+		panic(fmt.Errorf("failed to open database: %w", err))
+	}
+	defer db.Close()
+
 	c := setupCron()
 	go c.Start()
 
 	app := setupRoutes()
-	log.Fatal(app.Listen(":3000"))
+	if err := app.Listen(":3000"); err != nil {
+		panic(fmt.Errorf("failed to start server: %w", err))
+	}
 }
 
 func setupMdParser() *converter.Converter {
-	conv := converter.NewConverter(
+	return converter.NewConverter(
 		converter.WithPlugins(
 			base.NewBasePlugin(),
 			commonmark.NewCommonmarkPlugin(
@@ -67,7 +82,6 @@ func setupMdParser() *converter.Converter {
 			),
 		),
 	)
-	return conv
 }
 
 func DecodeKey(key string) string {
@@ -78,176 +92,148 @@ func DecodeKey(key string) string {
 }
 
 func setupRoutes() *fiber.App {
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		JSONEncoder: json.Marshal,
+		JSONDecoder: json.Unmarshal,
+		AppName:     "NostrFeed",
+	})
 	app.Use(logger.New())
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello, World!")
 	})
-	app.Post("/rss", func(c *fiber.Ctx) error {
-		req := new(FeedRequest)
-		if err := c.BodyParser(req); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error":   "invalid request",
-				"message": err.Error(),
-			})
-		}
 
-		feed := &Feed{
-			FeedRequest: FeedRequest{
-				Url:     req.Url,
-				PubKey:  DecodeKey(req.PubKey),
-				PrivKey: DecodeKey(req.PrivKey),
-				Relay:   req.Relay,
-			},
-			ToPublish: make(chan nostr.Event, 100), // Canal com buffer para evitar bloqueios
-		}
-		AddRssToFeed(feed)
-		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"success": true,
-			"message": "rss feed added",
-		})
-	})
-	app.Get("/rss", func(c *fiber.Ctx) error {
-		return c.Status(fiber.StatusOK).JSON(GetRssToFeed())
-	})
+	app.Post("/rss", addRssHandler)
+	app.Get("/rss", getRssHandler)
+
 	return app
 }
 
-func GetRssToFeed() map[string]*Feed {
-	dataMu.RLock()
-	defer dataMu.RUnlock()
-	return Data
-}
-
-func AddRssToFeed(feed *Feed) {
-	dataMu.Lock()
-	defer dataMu.Unlock()
-	Data[feed.Url] = feed
-}
-
-// ProcessFeedItem processes a feed item and sends it to the relay
-func ProcessFeedItem(feed *Feed, item *gofeed.Item) {
-	if item.Link == "" {
-		return
+func addRssHandler(c *fiber.Ctx) error {
+	req := new(FeedRequest)
+	if err := c.BodyParser(req); err != nil {
+		return fiberError(c, fiber.StatusBadRequest, "invalid request", err)
 	}
 
-	feed.mu.Lock()
-	if slices.Contains(feed.PublishedLink, item.Link) {
-		feed.mu.Unlock()
-		return
+	if req.Url == "" || req.PubKey == "" || req.PrivKey == "" || req.Relay == "" {
+		return fiberError(c, fiber.StatusBadRequest, "missing required fields", nil)
 	}
-	feed.mu.Unlock()
+	if Data[req.Url] != nil {
+		return fiberError(c, fiber.StatusBadRequest, "feed already exists", nil)
+	}
 
-	markdown, err := mdConverter.ConvertString(TernaryString(item.Content, item.Description))
+	feed := &Feed{
+		FeedRequest: *req,
+		ToPublish:   make(chan nostr.Event, 100),
+	}
+
+	if err := AddRssToFeed(feed); err != nil {
+		return fiberError(c, fiber.StatusInternalServerError, "error adding feed", err)
+	}
+
+	return c.JSON(fiber.Map{"success": true, "message": "rss feed added"})
+}
+
+func getRssHandler(c *fiber.Ctx) error {
+	feeds, err := GetRssToFeed()
 	if err != nil {
-		log.Error("Error converting to markdown", err)
-		return
+		return fiberError(c, fiber.StatusInternalServerError, "error getting feeds", err)
+	}
+	return c.JSON(feeds)
+}
+
+func fiberError(c *fiber.Ctx, status int, message string, err error) error {
+	return c.Status(status).JSON(fiber.Map{
+		"success": false,
+		"message": message,
+		"error":   err.Error(),
+	})
+}
+func CheckMapFeedEmpty(m FeedData) bool {
+	if m != nil && len(m) > 0 {
+		return true
+	}
+	return false
+}
+
+func GetRssToFeed() (FeedData, error) {
+	if CheckMapFeedEmpty(Data) {
+		return Data, nil
 	}
 
-	t := make([]nostr.Tag, 0)
-	t = append(t, nostr.Tag{"title", item.Title, ""})
-	t = append(t, nostr.Tag{"proxy", item.Link, "activitypub"})
+	iter, _ := db.NewIter(&pebble.IterOptions{})
+	defer iter.Close()
 
-	t = append(t, nostr.Tag{"d", ToSnakeCase(item.Title), ""})
-
-	for _, category := range item.Categories {
-		t = append(t, nostr.Tag{"t", category, ""})
-	}
-	if item.Custom["summary"] != "" {
-		summary, err := mdConverter.ConvertString(item.Custom["summary"])
-		if err != nil {
-			log.Error("Error converting summary to markdown", err)
-			return
+	for iter.First(); iter.Valid(); iter.Next() {
+		var feed Feed
+		if err := json.Unmarshal(iter.Value(), &feed); err != nil {
+			return nil, fmt.Errorf("error unmarshalling feed: %w", err)
 		}
-		t = append(t, nostr.Tag{"summary", summary, ""})
-	}
-	if item.Image != nil {
-		t = append(t, nostr.Tag{"image", item.Image.URL, ""})
+		feed.ToPublish = make(chan nostr.Event, 100)
+		Data[string(iter.Key())] = &feed
 	}
 
-	if item.Authors != nil {
-		t = append(t, nostr.Tag{"author", item.Authors[0].Name, ""})
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("error during iteration: %w", err)
 	}
-
-	if item.PublishedParsed != nil {
-		t = append(t, nostr.Tag{"published_at", strconv.Itoa(int(item.PublishedParsed.Unix())), ""})
-	}
-
-	ev := nostr.Event{
-		Kind:      nostr.KindArticle,
-		CreatedAt: nostr.Now(),
-		PubKey:    feed.PubKey,
-		Content:   markdown,
-		Tags:      t,
-	}
-
-	err = ev.Sign(feed.PrivKey)
-	if err != nil {
-		log.Error("Error signing event", err)
-		return
-	}
-
-	log.Debug(ev.String())
-	feed.ToPublish <- ev
-
+	return Data, nil
 }
 
-// PublishEvents publishes events to the relay
-func PublishEvents(feed *Feed) {
-	ctx := context.Background()
-	rs, err := nostr.RelayConnect(ctx, feed.Relay)
+func AddRssToFeed(feed *Feed) error {
+	//Data[feed.Url] = feed
+	value, err := json.Marshal(feed)
 	if err != nil {
-		log.Error("failed to connect to relay", err)
-		return
+		return fmt.Errorf("error marshalling feed: %w", err)
 	}
-	defer rs.Close()
 
-	for ev := range feed.ToPublish {
-		time.Sleep(1 * time.Second)
-		err := rs.Publish(ctx, ev)
-		if err != nil {
-			log.Error("failed to publish message", err)
-			continue
-		}
-		feed.mu.Lock()
-		feed.PublishedLink = append(feed.PublishedLink, ev.Tags.GetFirst([]string{"proxy"}).Value())
-		feed.mu.Unlock()
+	if err := db.Set([]byte(feed.Url), value, pebble.Sync); err != nil {
+		return fmt.Errorf("error setting data to db: %w", err)
 	}
-	log.Info("PublishEvents goroutine finished for: ", feed.Url)
+	return nil
 }
 
-// setupCron sets up the cron job
 func setupCron() *cron.Cron {
 	c := cron.New()
+
 	c.AddFunc("*/2 * * * *", func() {
-		dataMu.RLock()
-		feeds := Data
-		dataMu.RUnlock()
+		feeds, err := GetRssToFeed()
+		if err != nil {
+			fmt.Println("Error getting feeds for cron: ", err)
+			return
+		}
 		for _, feed := range feeds {
-			items, err := parseUrl(feed.Url)
-			if err != nil {
-				log.Error("Error parsing feed: ", feed.Url, err)
-				continue
-			}
-			log.Info("Processing feed: ", feed.Url, "Items:", len(items))
-			for _, item := range items {
-				go ProcessFeedItem(feed, item)
-			}
+			processFeedItems(feed)
 		}
 	})
+
 	c.AddFunc("* * * * *", func() {
-		dataMu.RLock()
-		feeds := Data
-		dataMu.RUnlock()
+		log.Info("Running cron job 1m")
+		feeds, err := GetRssToFeed()
+		log.Debug("Feeds: ", feeds)
+		if err != nil {
+			log.Error("Error getting feeds for cron: ", err)
+			return
+		}
 		for _, feed := range feeds {
-			go PublishEvents(feed) // Inicia a goroutine de publicação
+			go PublishEvents(feed)
 		}
 	})
+
 	return c
 }
 
-// parseUrl parses a URL and returns the feed items
+func processFeedItems(feed *Feed) {
+	items, err := parseUrl(feed.Url)
+	if err != nil {
+		fmt.Println("Error parsing feed: ", feed.Url, err)
+		return
+	}
+
+	for _, item := range items {
+		ProcessFeedItem(feed, item)
+	}
+}
+
 func parseUrl(url string) ([]*gofeed.Item, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -258,15 +244,99 @@ func parseUrl(url string) ([]*gofeed.Item, error) {
 	return feed.Items, nil
 }
 
-// ToSnakeCase converts a string to snake_case
-func ToSnakeCase(str string) string {
-	str = snakeCaseRegex.ReplaceAllString(str, "_")
-	str = strings.TrimSpace(str)
-	return strings.ToLower(str)
+func ProcessFeedItem(feed *Feed, item *gofeed.Item) {
+	if item.Link == "" {
+		return
+	}
+
+	feed.mu.Lock()
+	if slices.Contains(feed.PublishedLink, item.Link) {
+		feed.mu.Unlock()
+		return
+	}
+	feed.PublishedLink = append(feed.PublishedLink, item.Link)
+	feed.mu.Unlock()
+
+	markdown, err := mdConverter.ConvertString(ternary(item.Content, item.Description))
+	if err != nil {
+		fmt.Println("Error converting to markdown: ", err)
+		return
+	}
+
+	tags := createTags(item)
+	ev := nostr.Event{
+		Kind:      nostr.KindArticle,
+		CreatedAt: nostr.Now(),
+		PubKey:    DecodeKey(feed.PubKey),
+		Content:   markdown,
+		Tags:      tags,
+	}
+
+	if err := ev.Sign(DecodeKey(feed.PrivKey)); err != nil {
+		fmt.Println("Error signing event: ", err)
+		return
+	}
+
+	log.Debug("Event: ", ev)
+
+	feed.ToPublish <- ev
 }
 
-// TernaryString returns the first string if it is not empty, otherwise it returns the second string
-func TernaryString(a, b string) string {
+func createTags(item *gofeed.Item) []nostr.Tag {
+	tags := []nostr.Tag{
+		{"title", item.Title, ""},
+		{"proxy", item.Link, "activitypub"},
+		{"d", ToSnakeCase(item.Title), ""},
+	}
+
+	for _, category := range item.Categories {
+		tags = append(tags, nostr.Tag{"t", category, ""})
+	}
+
+	if summary := item.Custom["summary"]; summary != "" {
+		summaryMd, _ := mdConverter.ConvertString(summary)
+		tags = append(tags, nostr.Tag{"summary", summaryMd, ""})
+	}
+
+	if item.Image != nil {
+		tags = append(tags, nostr.Tag{"image", item.Image.URL, ""})
+	}
+
+	if authors := item.Authors; len(authors) > 0 {
+		tags = append(tags, nostr.Tag{"author", authors[0].Name, ""})
+	}
+
+	if published := item.PublishedParsed; published != nil {
+		tags = append(tags, nostr.Tag{"published_at", strconv.Itoa(int(published.Unix())), ""})
+	}
+
+	return tags
+}
+
+func PublishEvents(feed *Feed) {
+	ctx := context.Background()
+	rs, err := nostr.RelayConnect(ctx, feed.Relay)
+	if err != nil {
+		fmt.Println("Failed to connect to relay: ", err)
+		return
+	}
+	defer rs.Close()
+
+	for ev := range feed.ToPublish {
+		time.Sleep(1 * time.Second)
+		if err := rs.Publish(ctx, ev); err != nil {
+			fmt.Println("Failed to publish message: ", err)
+			continue
+		}
+	}
+}
+
+func ToSnakeCase(str string) string {
+	str = snakeCaseRegex.ReplaceAllString(str, "_")
+	return strings.ToLower(strings.TrimSpace(str))
+}
+
+func ternary(a, b string) string {
 	if a != "" {
 		return a
 	}
