@@ -68,3 +68,8 @@ A resposta será um JSON contendo todos os feeds configurados.
 ### Contribuições
 
 Sinta-se à vontade para contribuir com melhorias, correções de bugs e novas funcionalidades!
+Ou enviar Sats para `verdantkite75@walletofsatoshi.com` para apoiar o desenvolvimento.
+
+---
+
+Feito com ❤️ para a comunidade Nostr.

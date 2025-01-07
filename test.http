@@ -16,7 +16,7 @@ Content-Type: application/json
 
 {
   "url": "https://revistaoeste.com/feed/",
-  "name": "revistaoeste",
+  "name": "RevistaOeste",
   "pub_key": "npub1",
   "priv_key": "nsec1",
   "relay": "ws://127.0.0.1:9090/relay"
