@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/gofiber/fiber/v2/log"
+	"github.com/gofiber/fiber/v2/middleware/etag"
 	"regexp"
 	"slices"
 	"strconv"
@@ -26,9 +27,8 @@ import (
 
 type Feed struct {
 	FeedRequest   `json:"feed_request"`
-	ToPublish     chan nostr.Event `json:"-"`
-	PublishedLink []string         `json:"published_link"`
-	mu            sync.Mutex       `json:"-"`
+	PublishedLink []string   `json:"published_link"`
+	mu            sync.Mutex `json:"-"`
 }
 
 type FeedRequest struct {
@@ -101,6 +101,7 @@ func setupRoutes() *fiber.App {
 		AppName:     "NostrFeed",
 	})
 	app.Use(logger.New())
+	app.Use(etag.New())
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello, World!")
@@ -108,6 +109,7 @@ func setupRoutes() *fiber.App {
 
 	app.Post("/rss", addRssHandler)
 	app.Get("/rss", getRssHandler)
+
 	app.Get("/events", listEventsHandler)
 
 	return app
@@ -136,7 +138,6 @@ func addRssHandler(c *fiber.Ctx) error {
 
 	feed := &Feed{
 		FeedRequest: *req,
-		ToPublish:   make(chan nostr.Event, 100),
 	}
 
 	if err := AddRssToFeed(feed); err != nil {
@@ -183,7 +184,6 @@ func GetRssToFeed() (FeedData, error) {
 		if err := json.Unmarshal(iter.Value(), &feed); err != nil {
 			return nil, fmt.Errorf("error unmarshalling feed: %w", err)
 		}
-		feed.ToPublish = make(chan nostr.Event, 100)
 		Data[string(iter.Key())] = &feed
 	}
 
@@ -205,13 +205,13 @@ func AddRssToFeed(feed *Feed) error {
 	}
 	return nil
 }
-func SaveEventToDb(feed *Feed, ev nostr.Event) error {
+func SaveEventToDb(feed *Feed, ev nostr.Event, id string) error {
 	value, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("error marshalling event: %w", err)
 	}
 
-	key := fmt.Sprintf("%s%s_%s", eventPrefix, feed.Url, ev.ID)
+	key := fmt.Sprintf("%s%s_%s", eventPrefix, feed.Url, id)
 
 	if err := db.Set([]byte(key), value, pebble.Sync); err != nil {
 		return fmt.Errorf("error setting event to db: %w", err)
@@ -230,6 +230,40 @@ func GetAllEventsFromDb() ([]nostr.Event, error) {
 		if err := json.Unmarshal(iter.Value(), &ev); err != nil {
 			return nil, fmt.Errorf("error unmarshalling event: %w", err)
 		}
+		if ev.Kind == 0 {
+			continue
+		}
+		events = append(events, ev)
+	}
+
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("error during iteration: %w", err)
+	}
+	return events, nil
+}
+func GetAllEventsToPublish(feed *Feed) ([]nostr.Event, error) {
+	var events []nostr.Event
+	iter, _ := db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte(eventPrefix + feed.Url + "_"),
+	})
+	defer iter.Close()
+
+	// para todos os eventos que não estiver em published_link, publicar
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		var ev nostr.Event
+		if err := json.Unmarshal(iter.Value(), &ev); err != nil {
+			return nil, fmt.Errorf("error unmarshalling event: %w", err)
+		}
+
+		url := strings.ReplaceAll(string(iter.Key()), eventPrefix+feed.Url+"_", "")
+
+		if slices.Contains(feed.PublishedLink, url) {
+			continue
+		}
+		if ev.Kind == 0 {
+			continue
+		}
 		events = append(events, ev)
 	}
 
@@ -239,10 +273,18 @@ func GetAllEventsFromDb() ([]nostr.Event, error) {
 	return events, nil
 }
 
+func CheckIfEventExists(feed *Feed, id string) bool {
+	key := fmt.Sprintf("%s%s_%s", eventPrefix, feed.Url, id)
+	if _, err, _ := db.Get([]byte(key)); err != nil {
+		return false
+	}
+	return true
+}
+
 func setupCron() *cron.Cron {
 	c := cron.New()
 
-	c.AddFunc("*/5 * * * *", func() {
+	c.AddFunc("*/2 * * * *", func() {
 		feeds, err := GetRssToFeed()
 		if err != nil {
 			fmt.Println("Error getting feeds for cron: ", err)
@@ -256,7 +298,6 @@ func setupCron() *cron.Cron {
 	c.AddFunc("* * * * *", func() {
 		log.Info("Running cron job 1m")
 		feeds, err := GetRssToFeed()
-		log.Debug("Feeds: ", feeds)
 		if err != nil {
 			log.Error("Error getting feeds for cron: ", err)
 			return
@@ -272,7 +313,7 @@ func setupCron() *cron.Cron {
 func processFeedItems(feed *Feed) {
 	items, err := parseUrl(feed.Url)
 	if err != nil {
-		fmt.Println("Error parsing feed: ", feed.Url, err)
+		log.Error("Error parsing feed: ", feed.Url, err)
 		return
 	}
 
@@ -301,12 +342,16 @@ func ProcessFeedItem(feed *Feed, item *gofeed.Item) {
 		feed.mu.Unlock()
 		return
 	}
+	if !CheckIfEventExists(feed, item.Link) {
+		feed.mu.Unlock()
+		return
+	}
 	feed.PublishedLink = append(feed.PublishedLink, item.Link)
 	feed.mu.Unlock()
 
-	markdown, err := mdConverter.ConvertString(ternary(item.Content, item.Description))
+	markdown, err := mdConverter.ConvertString(TernaryString(item.Content, item.Description))
 	if err != nil {
-		fmt.Println("Error converting to markdown: ", err)
+		log.Error("Error converting to markdown: ", err)
 		return
 	}
 
@@ -320,17 +365,19 @@ func ProcessFeedItem(feed *Feed, item *gofeed.Item) {
 	}
 
 	if err := ev.Sign(DecodeKey(feed.PrivKey)); err != nil {
-		fmt.Println("Error signing event: ", err)
+		log.Error("Error signing event: ", err)
+		return
+	}
+	if ok := ev.CheckID(); !ok {
+		log.Error("Error verifying event: ", err)
 		return
 	}
 
 	log.Debug("Event: ", ev)
-	err = SaveEventToDb(feed, ev)
+	err = SaveEventToDb(feed, ev, item.Link)
 	if err != nil {
 		log.Error("Error saving event to db: ", err)
 	}
-
-	feed.ToPublish <- ev
 }
 
 func createTags(item *gofeed.Item) []nostr.Tag {
@@ -368,18 +415,48 @@ func PublishEvents(feed *Feed) {
 	ctx := context.Background()
 	rs, err := nostr.RelayConnect(ctx, feed.Relay)
 	if err != nil {
-		fmt.Println("Failed to connect to relay: ", err)
+		log.Error("Failed to connect to relay: ", err)
 		return
 	}
 	defer rs.Close()
 
-	for ev := range feed.ToPublish {
+	// para todos os eventos que não estiver em published_link, publicar
+
+	events, err := GetAllEventsToPublish(feed)
+	if err != nil {
+		log.Error("Error getting events to publish: ", err)
+		return
+	}
+
+	for _, ev := range events {
 		time.Sleep(1 * time.Second)
 		if err := rs.Publish(ctx, ev); err != nil {
-			fmt.Println("Failed to publish message: ", err)
+			log.Error("Failed to publish message: ", err)
+			continue
+		}
+		err := MarkEventAsPublished(feed, ev.Tags.GetFirst([]string{"proxy"}).Value())
+		if err != nil {
+			log.Error("Failed to mark event as published: ", err)
 			continue
 		}
 	}
+
+}
+func MarkEventAsPublished(feed *Feed, id string) error {
+	feed.mu.Lock()
+	defer feed.mu.Unlock()
+
+	feed.PublishedLink = append(feed.PublishedLink, id)
+
+	value, err := json.Marshal(feed)
+	if err != nil {
+		return fmt.Errorf("error marshalling feed: %w", err)
+	}
+
+	if err := db.Set([]byte(dPrefix+feed.Url), value, pebble.Sync); err != nil {
+		return fmt.Errorf("error setting data to db: %w", err)
+	}
+	return nil
 }
 
 func ToSnakeCase(str string) string {
@@ -387,7 +464,7 @@ func ToSnakeCase(str string) string {
 	return strings.ToLower(strings.TrimSpace(str))
 }
 
-func ternary(a, b string) string {
+func TernaryString(a, b string) string {
 	if a != "" {
 		return a
 	}
