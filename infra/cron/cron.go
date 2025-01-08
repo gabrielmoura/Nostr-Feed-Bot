@@ -35,7 +35,8 @@ func setupMdParser() *converter.Converter {
 func SetupCron() *cron.Cron {
 	c := cron.New()
 
-	c.AddFunc("*/2 * * * *", func() {
+	c.AddFunc("*/5 * * * *", func() {
+		log.Debug("Running extract feeds cron")
 		feeds, err := db.GetRssToFeed()
 		if err != nil {
 			fmt.Println("Error getting feeds for cron: ", err)
@@ -45,17 +46,12 @@ func SetupCron() *cron.Cron {
 			processFeedItems(feed)
 		}
 	})
-
-	c.AddFunc("* * * * *", func() {
-		log.Info("Running cron job 1m")
-		feeds, err := db.GetRssToFeed()
+	c.AddFunc("*/15 * * * *", func() {
+		m, err := db.FlushDb()
 		if err != nil {
-			log.Error("Error getting feeds for cron: ", err)
-			return
+			fmt.Println("Error flushing db: ", err)
 		}
-		for _, feed := range feeds {
-			go PublishEvents(feed)
-		}
+		log.Debug("Flushed db,  ", m.String())
 	})
 
 	return c

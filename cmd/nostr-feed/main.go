@@ -4,6 +4,7 @@ import (
 	"Nostr-feed-bot/infra/cron"
 	"Nostr-feed-bot/infra/db"
 	"Nostr-feed-bot/infra/http"
+	"Nostr-feed-bot/infra/relay"
 	"fmt"
 	"github.com/gofiber/fiber/v2/log"
 )
@@ -17,6 +18,7 @@ func main() {
 
 	c := cron.SetupCron()
 	go c.Start()
+	go relay.InitPublisher()
 
 	app := http.SetupRoutes()
 	if err := app.Listen(":3000"); err != nil {

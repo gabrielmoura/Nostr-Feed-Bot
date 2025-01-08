@@ -5,8 +5,8 @@ Content-Type: application/json
 {
   "url": "https://pplware.sapo.pt/feed",
   "name": "Plpware",
-  "pub_key": "npub1",
-  "priv_key": "nsec1",
+  "pub_key": "npub",
+  "priv_key": "nsec",
   "relay": "ws://127.0.0.1:9090/relay"
 }
 
@@ -16,11 +16,61 @@ Content-Type: application/json
 
 {
   "url": "https://revistaoeste.com/feed/",
-  "name": "RevistaOeste",
-  "pub_key": "npub1",
-  "priv_key": "nsec1",
+  "name": "revistaoeste",
+  "pub_key": "npub",
+  "priv_key": "nsec",
   "relay": "ws://127.0.0.1:9090/relay"
 }
+
+### Set up a new RSS feed (G1 Economia)
+POST http://localhost:3000/rss
+Content-Type: application/json
+
+{
+  "url": "https://g1.globo.com/dynamo/economia/rss2.xml",
+  "name": "g1_economia",
+  "pub_key": "npub",
+  "priv_key": "nsec",
+  "relay": "ws://127.0.0.1:9090/relay"
+}
+### Set up a new RSS feed (G1 Rio de Janeiro)
+POST http://localhost:3000/rss
+Content-Type: application/json
+
+{
+  "url": "https://g1.globo.com/rss/g1/rio-de-janeiro",
+  "name": "g1_rj",
+  "pub_key": "npub",
+  "priv_key": "nsec",
+  "relay": "ws://127.0.0.1:9090/relay"
+}
+
+
+### Set up a new RSS feed (Gazeta do Povo - Economia)
+POST http://localhost:3000/rss
+Content-Type: application/json
+
+{
+  "url": "https://www.gazetadopovo.com.br/feed/rss/economia.xml",
+  "name": "gazeta_economia",
+  "pub_key": "npub",
+  "priv_key": "nsec",
+  "relay": "ws://127.0.0.1:9090/relay"
+}
+
+
+### Set up a new RSS feed (Gazeta do Povo - Educação)
+POST http://localhost:3000/rss
+Content-Type: application/json
+
+{
+  "url": "https://www.gazetadopovo.com.br/feed/rss/educacao.xml",
+  "name": "gazeta_educacao",
+  "pub_key": "npub",
+  "priv_key": "nsec",
+  "relay": "ws://127.0.0.1:9090/relay"
+}
+
 
 ### Get all RSS feeds
 GET http://localhost:3000/rss

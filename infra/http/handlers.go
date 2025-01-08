@@ -2,6 +2,7 @@ package http
 
 import (
 	"Nostr-feed-bot/infra/db"
+	"Nostr-feed-bot/infra/util"
 	db2 "Nostr-feed-bot/internal/db"
 	"github.com/gofiber/fiber/v2"
 )
@@ -20,15 +21,22 @@ func addRssHandler(c *fiber.Ctx) error {
 		return fiberError(c, fiber.StatusBadRequest, "invalid request", err)
 	}
 
-	if req.Url == "" || req.PubKey == "" || req.PrivKey == "" || req.Relay == "" {
+	if req.Url == "" || req.PubKey == "" || req.PrivKey == "" || req.Relay == "" || req.Name == "" {
 		return fiberError(c, fiber.StatusBadRequest, "missing required fields", nil)
 	}
-	if db.Data[req.Url] != nil {
+	name := util.ToSnakeCase(req.Name)
+	if !db.CheckIfFeedExists(name) {
 		return fiberError(c, fiber.StatusBadRequest, "feed already exists", nil)
 	}
 
 	feed := &db2.Feed{
-		FeedRequest: *req,
+		FeedRequest: db2.FeedRequest{
+			Name:    name,
+			Url:     req.Url,
+			Relay:   req.Relay,
+			PrivKey: req.PrivKey,
+			PubKey:  req.PubKey,
+		},
 	}
 
 	if err := db.AddRssToFeed(feed); err != nil {
@@ -39,7 +47,7 @@ func addRssHandler(c *fiber.Ctx) error {
 }
 
 func getRssHandler(c *fiber.Ctx) error {
-	feeds, err := db.GetRssToFeed()
+	feeds, err := db.GetRssWithPublishedLinks()
 	if err != nil {
 		return fiberError(c, fiber.StatusInternalServerError, "error getting feeds", err)
 	}

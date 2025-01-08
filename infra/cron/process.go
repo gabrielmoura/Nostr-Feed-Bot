@@ -10,7 +10,6 @@ import (
 	"github.com/mmcdole/gofeed"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,7 +43,9 @@ func createTags(item *gofeed.Item) []nostr.Tag {
 	}
 
 	for _, category := range item.Categories {
-		tags = append(tags, nostr.Tag{"t", util.ToSnakeCase(category), ""})
+		if category != "" {
+			tags = append(tags, nostr.Tag{"t", util.ToSnakeCase(category), ""})
+		}
 	}
 
 	if summary := item.Custom["summary"]; summary != "" {
@@ -83,20 +84,19 @@ func DecodeKey(key string) string {
 }
 
 func ProcessFeedItem(feed *db.Feed, item *gofeed.Item) {
-	if item.Link == "" {
+	guid := util.TernaryString(item.Link, item.GUID)
+	if guid == "" {
 		return
 	}
 
-	feed.Lock()
-	if slices.Contains(feed.PublishedLink, item.Link) {
-		feed.Unlock()
+	if db2.CheckHasPublished(feed, item.Link) {
+
 		return
 	}
 	if !db2.CheckIfEventExists(feed, item.Link) {
-		feed.Unlock()
+
 		return
 	}
-	feed.Unlock()
 
 	markdown, err := mdConverter.ConvertString(util.TernaryString(item.Content, item.Description))
 	if err != nil {
@@ -123,8 +123,7 @@ func ProcessFeedItem(feed *db.Feed, item *gofeed.Item) {
 		return
 	}
 
-	log.Debug("Event: ", ev)
-	err = db2.SaveEventToDb(feed, ev, item.Link)
+	err = db2.SaveEventToDb(feed.Name, ev, guid)
 	if err != nil {
 		log.Error("Error saving event to db: ", err)
 	}

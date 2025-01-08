@@ -29,14 +29,16 @@ Para adicionar um feed, envie uma requisição POST para `/rss` com os seguintes
   "url": "URL_DO_SEU_FEED_RSS",
   "pub_key": "SUA_CHAVE_PÚBLICA_NOSTR",
   "priv_key": "SUA_CHAVE_PRIVADA_NOSTR",
-  "relay": "URL_DO_SEU_RELAY_NOSTR"
+  "relay": "URL_DO_SEU_RELAY_NOSTR",
+  "name": "NOME_DO_FEED"
 }
 ```
 
--   `url`: URL do feed RSS ou Atom.
--   `pub_key`: Sua chave pública Nostr (codificada ou não).
--   `priv_key`: Sua chave privada Nostr (codificada ou não).
--   `relay`: URL do relay Nostr para onde os eventos serão publicados.
+- `url`: URL do feed RSS ou Atom.
+- `pub_key`: Sua chave pública Nostr (codificada ou não).
+- `priv_key`: Sua chave privada Nostr (codificada ou não).
+- `relay`: URL do relay Nostr para onde os eventos serão publicados.
+- `name`: Nome do feed.
 
 Exemplo usando `curl`:
 
@@ -59,11 +61,21 @@ curl http://localhost:3000/rss
 
 A resposta será um JSON contendo todos os feeds configurados.
 
+#### Ver todos os eventos
+
+Para visualizar todos os eventos publicados, envie uma requisição GET para `/events`:
+
+```bash
+curl http://localhost:3000/events
+```
+
+A resposta será um JSON contendo todos os eventos publicados.
+
 ### Configuração
 
--   O bot busca novos itens dos feeds a cada 2 minutos.
--   A publicação dos eventos no relay é feita a cada minuto.
--   Você pode configurar o intervalo de busca e publicação editando as strings do `cron` em `setupCron`.
+- O bot busca novos itens dos feeds a cada 2 minutos.
+- A publicação dos eventos no relay é feita a cada minuto.
+- Você pode configurar o intervalo de busca e publicação editando as strings do `cron` em `setupCron`.
 
 ### Contribuições
 

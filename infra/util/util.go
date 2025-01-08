@@ -14,9 +14,11 @@ func CheckMapFeedEmpty(m db.FeedData) bool {
 }
 
 func ToSnakeCase(str string) string {
-	snakeCaseRegex := regexp.MustCompile("[^a-zA-Z0-9]+")
+	// Regex que permite letras Unicode (\p{L}) e números (\p{N})
+
+	snakeCaseRegex := regexp.MustCompile(`[^\p{L}\p{N}]+`)
 	str = snakeCaseRegex.ReplaceAllString(str, "_")
-	return strings.ToLower(strings.TrimSpace(str))
+	return strings.Trim(strings.ToLower(strings.TrimSpace(str)), "_")
 }
 
 func TernaryString(a, b string) string {
